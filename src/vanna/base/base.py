@@ -63,9 +63,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import sqlparse
+import tiktoken
 
 from ..exceptions import DependencyError, ImproperlyConfigured, ValidationError
-from ..types import TrainingPlan, TrainingPlanItem, TableMetadata
+from ..types import TrainingPlan, TrainingPlanItem
 from ..utils import validate_config_path
 
 
@@ -79,10 +80,43 @@ class VannaBase(ABC):
         self.static_documentation = ""
         self.dialect = self.config.get("dialect", "SQL")
         self.language = self.config.get("language", None)
-        self.max_tokens = self.config.get("max_tokens", 14000)
+        self.max_tokens = self.config.get("max_tokens", 25000)
 
     def log(self, message: str, title: str = "Info"):
         print(f"{title}: {message}")
+    
+    def log_token_usage(self, function_name: str, input_text: str, output_text: str):
+        """
+        Log the input and output token sizes for a given function.
+
+        Args:
+            function_name (str): The name of the function calling the LLM.
+            input_text (str): The input text sent to the LLM.
+            output_text (str): The output text received from the LLM.
+        """
+        input_tokens = self.count_tokens(input_text)
+        output_tokens = self.count_tokens(output_text)
+        log_message = f"Function: {function_name} - Input Tokens: {input_tokens}, Output Tokens: {output_tokens}"
+        self.log(log_message, title="Token Usage")
+    
+    def count_tokens(self, text: str) -> int:
+        """
+        Count the number of tokens in a given text.
+
+        Args:
+            text (str): The text to count tokens for.
+
+        Returns:
+            int: The number of tokens in the text.
+        """
+        # Use tiktoken or another tokenizer to count tokens
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")  # Adjust encoding based on your LLM
+            return len(encoding.encode(text))
+        except ImportError:
+            # Fallback to a simple approximation if tiktoken is not installed
+            return len(text.split())  # Approximate tokens by splitting on spaces
+
 
     def _response_language(self) -> str:
         if self.language is None:
@@ -90,7 +124,7 @@ class VannaBase(ABC):
 
         return f"Respond in the {self.language} language."
 
-    def generate_sql(self, question: str, allow_llm_to_see_data=False, **kwargs) -> str:
+    def generate_sql(self, question: str, context:str, allow_llm_to_see_data=True, **kwargs) -> str:
         """
         Example:
         ```python
@@ -121,12 +155,14 @@ class VannaBase(ABC):
             initial_prompt = self.config.get("initial_prompt", None)
         else:
             initial_prompt = None
+        
+
         question_sql_list = self.get_similar_question_sql(question, **kwargs)
         ddl_list = self.get_related_ddl(question, **kwargs)
         doc_list = self.get_related_documentation(question, **kwargs)
         prompt = self.get_sql_prompt(
             initial_prompt=initial_prompt,
-            question=question,
+            question= context + "\nThe above are the previous chat history and below you have the current question" + question,
             question_sql_list=question_sql_list,
             ddl_list=ddl_list,
             doc_list=doc_list,
@@ -136,6 +172,9 @@ class VannaBase(ABC):
         llm_response = self.submit_prompt(prompt, **kwargs)
         self.log(title="LLM Response", message=llm_response)
 
+        # Log token usage
+        self.log_token_usage("generate_sql", str(prompt), llm_response)
+
         if 'intermediate_sql' in llm_response:
             if not allow_llm_to_see_data:
                 return "The LLM is not allowed to see the data in your database. Your question requires database introspection to generate the necessary SQL. Please set allow_llm_to_see_data=True to enable this."
@@ -143,26 +182,55 @@ class VannaBase(ABC):
             if allow_llm_to_see_data:
                 intermediate_sql = self.extract_sql(llm_response)
 
-                try:
-                    self.log(title="Running Intermediate SQL", message=intermediate_sql)
-                    df = self.run_sql(intermediate_sql)
+                for retry in range(4):  # Allow one retry if the intermediate SQL fails
+                    try:
+                        self.log(title="Running Intermediate SQL", message=intermediate_sql)
+                        df = self.run_sql(intermediate_sql)
 
-                    prompt = self.get_sql_prompt(
-                        initial_prompt=initial_prompt,
-                        question=question,
-                        question_sql_list=question_sql_list,
-                        ddl_list=ddl_list,
-                        doc_list=doc_list+[f"The following is a pandas DataFrame with the results of the intermediate SQL query {intermediate_sql}: \n" + df.to_markdown()],
-                        **kwargs,
-                    )
-                    self.log(title="Final SQL Prompt", message=prompt)
-                    llm_response = self.submit_prompt(prompt, **kwargs)
-                    self.log(title="LLM Response", message=llm_response)
-                except Exception as e:
-                    return f"Error running intermediate SQL: {e}"
+                        # Success: Use the results in the final prompt
+                        prompt = self.get_sql_prompt(
+                            initial_prompt=initial_prompt,
+                            question=question,
+                            question_sql_list=question_sql_list,
+                            ddl_list=ddl_list,
+                            doc_list=doc_list + [
+                                f"The following is a pandas DataFrame with the results of the intermediate SQL query {intermediate_sql}: \n"
+                                + df.to_markdown()
+                            ],
+                            **kwargs,
+                        )
+                        self.log(title="Final SQL Prompt", message=prompt)
+                        llm_response = self.submit_prompt(prompt, **kwargs)
+                        self.log(title="LLM Response", message=llm_response)
 
+                        # Log token usage for the final prompt
+                        self.log_token_usage("generate_sql_final", str(prompt), llm_response)
+
+                        break  # Exit the retry loop if successful
+                    except Exception as e:
+                        self.log(
+                            title="Error Running Intermediate SQL",
+                            message=f"Attempt {retry + 1}: {e}",
+                        )
+
+                        # Retry by requesting a corrected SQL query
+                        if retry < 1:  # Ensure it's not the last retry
+                            prompt = self.get_sql_prompt(
+                                initial_prompt=initial_prompt,
+                                question=f"The previous intermediate SQL query failed. Please generate a corrected query for the question: {question}",
+                                question_sql_list=question_sql_list,
+                                ddl_list=ddl_list,
+                                doc_list=doc_list,
+                                **kwargs,
+                            )
+                            self.log(title="Retry SQL Prompt", message=prompt)
+                            llm_response = self.submit_prompt(prompt, **kwargs)
+                            intermediate_sql = self.extract_sql(llm_response)
+                        else:
+                            return f"Failed to generate a valid SQL query after retries: {e}"
 
         return self.extract_sql(llm_response)
+
 
     def extract_sql(self, llm_response: str) -> str:
         """
@@ -209,54 +277,6 @@ class VannaBase(ABC):
             return sql
 
         return llm_response
-
-    def extract_table_metadata(ddl: str) -> TableMetadata:
-      """
-        Example:
-        ```python
-        vn.extract_table_metadata("CREATE TABLE hive.bi_ads.customers (id INT, name TEXT, sales DECIMAL)")
-        ```
-
-        Extracts the table metadata from a DDL statement. This is useful in case the DDL statement contains other information besides the table metadata.
-        Override this function if your DDL statements need custom extraction logic.
-
-        Args:
-            ddl (str): The DDL statement.
-
-        Returns:
-            TableMetadata: The extracted table metadata.
-        """
-      pattern_with_catalog_schema = re.compile(
-        r'CREATE TABLE\s+(\w+)\.(\w+)\.(\w+)\s*\(',
-        re.IGNORECASE
-      )
-      pattern_with_schema = re.compile(
-        r'CREATE TABLE\s+(\w+)\.(\w+)\s*\(',
-        re.IGNORECASE
-      )
-      pattern_with_table = re.compile(
-        r'CREATE TABLE\s+(\w+)\s*\(',
-        re.IGNORECASE
-      )
-
-      match_with_catalog_schema = pattern_with_catalog_schema.search(ddl)
-      match_with_schema = pattern_with_schema.search(ddl)
-      match_with_table = pattern_with_table.search(ddl)
-
-      if match_with_catalog_schema:
-        catalog = match_with_catalog_schema.group(1)
-        schema = match_with_catalog_schema.group(2)
-        table_name = match_with_catalog_schema.group(3)
-        return TableMetadata(catalog, schema, table_name)
-      elif match_with_schema:
-        schema = match_with_schema.group(1)
-        table_name = match_with_schema.group(2)
-        return TableMetadata(None, schema, table_name)
-      elif match_with_table:
-        table_name = match_with_table.group(1)
-        return TableMetadata(None, None, table_name)
-      else:
-        return TableMetadata()
 
     def is_sql_valid(self, sql: str) -> bool:
         """
@@ -357,12 +377,23 @@ class VannaBase(ABC):
                 f"You are a helpful data assistant. The user asked the question: '{question}'\n\nThe SQL query for this question was: {sql}\n\nThe following is a pandas DataFrame with the results of the query: \n{df.to_markdown()}\n\n"
             ),
             self.user_message(
-                f"Generate a list of {n_questions} followup questions that the user might ask about this data. Respond with a list of questions, one per line. Do not answer with any explanations -- just the questions. Remember that there should be an unambiguous SQL query that can be generated from the question. Prefer questions that are answerable outside of the context of this conversation. Prefer questions that are slight modifications of the SQL query that was generated that allow digging deeper into the data. Each question will be turned into a button that the user can click to generate a new SQL query so don't use 'example' type questions. Each question must have a one-to-one correspondence with an instantiated SQL query." +
+                f"""Generate a list of {n_questions} followup questions that the user might ask about this data. 
+                Respond with a list of questions, one per line. 
+                Do not answer with any explanations -- just the questions. 
+                Remember that there should be an unambiguous SQL query that can be generated from the question. 
+                Prefer questions that are answerable outside of the context of this conversation. 
+                Prefer questions that are slight modifications of the SQL query that was generated that allow digging deeper into the data. 
+                Each question will be turned into a button that the user can click to generate a new SQL query so don't use 'example' type questions. 
+                Each question must have a one-to-one correspondence with an instantiated SQL query.
+                Recommend questions that requires columns/ data in the dataframe""" +
                 self._response_language()
             ),
         ]
+              
+        llm_response = self.submit_prompt(message_log , **kwargs)
 
-        llm_response = self.submit_prompt(message_log, **kwargs)
+        # Log token usage
+        self.log_token_usage("generate_followup_questions", str(message_log), llm_response)
 
         numbers_removed = re.sub(r"^\d+\.\s*", "", llm_response, flags=re.MULTILINE)
         return numbers_removed.split("\n")
@@ -378,9 +409,10 @@ class VannaBase(ABC):
         """
         question_sql = self.get_similar_question_sql(question="", **kwargs)
 
+
         return [q["question"] for q in question_sql]
 
-    def generate_summary(self, question: str, df: pd.DataFrame, **kwargs) -> str:
+    def generate_summary(self, question: str,sql:str, df: pd.DataFrame, **kwargs) -> str:
         """
         **Example:**
         ```python
@@ -399,15 +431,23 @@ class VannaBase(ABC):
 
         message_log = [
             self.system_message(
-                f"You are a helpful data assistant. The user asked the question: '{question}'\n\nThe following is a pandas DataFrame with the results of the query: \n{df.to_markdown()}\n\n"
+                f"""You are a helpful data summmarizer. The user asked the question: '{question}'\n\n
+                The following is a pandas DataFrame with the results of the query: \n{df.to_markdown()}\n\n
+                The sql query for this question which possiby generated the dataframe is \n {sql}\n\n"""
             ),
             self.user_message(
-                "Briefly summarize the data based on the question that was asked. Do not respond with any additional explanation beyond the summary." +
+                f"""Summarize the dataframe based on the question that was asked. 
+                    If the dataframe is empty, respond only with: 'The provided question has no answer from the database.'
+                    Do not generate or infer any data that is not present in the DataFrame. 
+                    Provide concise human like answers with no additional explanation or tables.""" +
                 self._response_language()
             ),
         ]
 
         summary = self.submit_prompt(message_log, **kwargs)
+
+        # Log token usage
+        self.log_token_usage("generate_summary", str(message_log), summary)
 
         return summary
 
@@ -444,31 +484,6 @@ class VannaBase(ABC):
         pass
 
     @abstractmethod
-    def search_tables_metadata(self,
-                              engine: str = None,
-                              catalog: str = None,
-                              schema: str = None,
-                              table_name: str = None,
-                              ddl: str = None,
-                              size: int = 10,
-                              **kwargs) -> list:
-        """
-        This method is used to get similar tables metadata.
-
-        Args:
-            engine (str): The database engine.
-            catalog (str): The catalog.
-            schema (str): The schema.
-            table_name (str): The table name.
-            ddl (str): The DDL statement.
-            size (int): The number of tables to return.
-
-        Returns:
-            list: A list of tables metadata.
-        """
-        pass
-
-    @abstractmethod
     def get_related_documentation(self, question: str, **kwargs) -> list:
         """
         This method is used to get related documentation to a question.
@@ -496,13 +511,12 @@ class VannaBase(ABC):
         pass
 
     @abstractmethod
-    def add_ddl(self, ddl: str, engine: str = None, **kwargs) -> str:
+    def add_ddl(self, ddl: str, **kwargs) -> str:
         """
         This method is used to add a DDL statement to the training data.
 
         Args:
             ddl (str): The DDL statement to add.
-            engine (str): The database engine that the DDL statement applies to.
 
         Returns:
             str: The ID of the training data that was added.
@@ -657,8 +671,12 @@ class VannaBase(ABC):
         """
 
         if initial_prompt is None:
-            initial_prompt = f"You are a {self.dialect} expert. " + \
-            "Please help to generate a SQL query to answer the question. Your response should ONLY be based on the given context and follow the response guidelines and format instructions. "
+            initial_prompt = f"""You are a {self.dialect} expert.
+                            Decide whether the given question requires sql response.
+                            If so, Please assist in generating a SQL query to answer the given question.
+                            Your response must strictly adhere to the provided context, response guidelines, and formatting instructions.
+                            If the given question is of casual converstion, stick to casual conversation and dont refer any related to sql and give human like answers.
+                            """
 
         initial_prompt = self.add_ddl_to_prompt(
             initial_prompt, ddl_list, max_tokens=self.max_tokens
@@ -673,13 +691,18 @@ class VannaBase(ABC):
 
         initial_prompt += (
             "===Response Guidelines \n"
-            "1. If the provided context is sufficient, please generate a valid SQL query without any explanations for the question. \n"
-            "2. If the provided context is almost sufficient but requires knowledge of a specific string in a particular column, please generate an intermediate SQL query to find the distinct strings in that column. Prepend the query with a comment saying intermediate_sql \n"
-            "3. If the provided context is insufficient, please explain why it can't be generated. \n"
-            "4. Please use the most relevant table(s). \n"
-            "5. If the question has been asked and answered before, please repeat the answer exactly as it was given before. \n"
-            f"6. Ensure that the output SQL is {self.dialect}-compliant and executable, and free of syntax errors. \n"
-        )
+            "1. If the context provided is sufficient, generate a valid SQL query for the question without including any explanations. \n"
+            "2. If the context is mostly sufficient but requires identifying specific strings in a column, generate an intermediate SQL query to find distinct strings in that column. Prefix the query with a comment saying -- intermediate_sql \n"
+            "3. If the context is insufficient, explain why the query cannot be generated. \n"
+            "4. Use the most relevant table(s) to construct the query.\n"
+            "5. Make sure you have all the parameters mentioned in the context are in the query you generate"
+            "5. If the question has already been answered, repeat the same response exactly as before. \n"
+            f"6.Ensure the generated SQL query is compliant with {self.dialect}, free of syntax errors, and executable in a {self.dialect} environment. \n"
+            "7. Do not enclose the SQL query in any extra text, such as backticks or comments. \n"
+            "8. When constructing queries with multiple table joins, provide clear aliases for columns to avoid ambiguity.\n"
+            "9. For questions involving checking on a place/people/any particular thing, please use pattern-matching operations.\n"
+            "Make sure the created sql query satisfies the question and its requirements"
+             )
 
         message_log = [self.system_message(initial_prompt)]
 
@@ -703,14 +726,14 @@ class VannaBase(ABC):
         doc_list: list,
         **kwargs,
     ) -> list:
-        initial_prompt = f"The user initially asked the question: '{question}': \n\n"
-
-        initial_prompt = self.add_ddl_to_prompt(
-            initial_prompt, ddl_list, max_tokens=self.max_tokens
-        )
+        initial_prompt = f"The user initially asked the question: '{question}': \n\n."
 
         initial_prompt = self.add_documentation_to_prompt(
             initial_prompt, doc_list, max_tokens=self.max_tokens
+        )
+
+        initial_prompt = self.add_ddl_to_prompt(
+            initial_prompt, ddl_list, max_tokens=self.max_tokens
         )
 
         initial_prompt = self.add_sql_to_prompt(
@@ -753,12 +776,18 @@ class VannaBase(ABC):
         response = self.submit_prompt(
             [
                 self.system_message(
-                    "The user will give you SQL and you will try to guess what the business question this query is answering. Return just the question without any additional explanation. Do not reference the table name in the question."
+                    '''The user will give you SQL and you will try to guess what the business question this query is answering.
+                       Return just the question without any additional explanation.
+                        Do not reference the table name in the question.
+                        Note: Give only the questions as response'''
                 ),
                 self.user_message(sql),
             ],
             **kwargs,
         )
+
+        # Log token usage
+        self.log_token_usage("generate_question", sql, response)
 
         return response
 
@@ -797,16 +826,37 @@ class VannaBase(ABC):
         if sql is not None:
             system_msg += f"\n\nThe DataFrame was produced using this query: {sql}\n\n"
 
-        system_msg += f"The following is information about the resulting pandas DataFrame 'df': \n{df_metadata}"
+        system_msg += f"The following is information about the resulting pandas DataFrame 'df' = \n{df_metadata}"
 
         message_log = [
             self.system_message(system_msg),
             self.user_message(
-                "Can you generate the Python plotly code to chart the results of the dataframe? Assume the data is in a pandas dataframe called 'df'. If there is only one value in the dataframe, use an Indicator. Respond with only Python code. Do not answer with any explanations -- just the code."
+                f"""Prompt:
+                You are a python visulization expert. Create python executable plotly code using the provided dataframe.
+                    1. Use the provided metadata of a pandas DataFrame named 'df': \n{df_metadata}.
+                    2. Do not assume, fabricate, or alter the DataFrame structure or its data.
+                    3. Based on the metadata, identify the most suitable visualization type for the data.
+                    - Consider the relationships, distributions, or trends indicated by the data's structure.
+                    - Use numerical, categorical, and datetime columns appropriately.
+                    4. Preprocess data only if required, such as grouping or aggregation.
+                    5. Generate Python code using Plotly that:
+                    - Creates a single, meaningful visualization.
+                    - Has clear axis labels and a descriptive title.
+                    - Dynamically adapts to the structure and characteristics of the DataFrame.
+                    6. If the DataFrame is empty, do not generate any code.
+                    Important:
+                    - The visualization must rely exclusively on the given DataFrame metadata.
+                    - Do not use or infer any additional data not described in the metadata.
+                    - DO NOT USE df = pd.DataFrame function or intialize it df = None whatsoever because df is already provided (df = {df_metadata})
+                    - Do not use ids as the axes.
+    """
             ),
         ]
 
         plotly_code = self.submit_prompt(message_log, kwargs=kwargs)
+
+        # Log token usage
+        self.log_token_usage("generate_plotly_code", str(message_log), plotly_code)
 
         return self._sanitize_plotly_code(self._extract_python_code(plotly_code))
 
@@ -1241,7 +1291,7 @@ class VannaBase(ABC):
         vn.connect_to_oracle(
         user="username",
         password="password",
-        dsn="host:port/sid",
+        dns="host:port/sid",
         )
         ```
         Args:
@@ -1357,8 +1407,7 @@ class VannaBase(ABC):
 
         if "google.colab" in sys.modules:
             try:
-                from google.colab import auth
-
+                from google.colab import auth # type: ignore
                 auth.authenticate_user()
             except Exception as e:
                 raise ImproperlyConfigured(e)
@@ -1396,7 +1445,7 @@ class VannaBase(ABC):
 
         def run_sql_bigquery(sql: str) -> Union[pd.DataFrame, None]:
             if conn:
-                job = conn.query(sql)
+                job = conn.querygoogle(sql)
                 df = job.result().to_dataframe()
                 return df
             return None
@@ -1852,7 +1901,6 @@ class VannaBase(ABC):
         question: str = None,
         sql: str = None,
         ddl: str = None,
-        engine: str = None,
         documentation: str = None,
         plan: TrainingPlan = None,
     ) -> str:
@@ -1873,11 +1921,8 @@ class VannaBase(ABC):
             question (str): The question to train on.
             sql (str): The SQL query to train on.
             ddl (str):  The DDL statement.
-            engine (str): The database engine.
             documentation (str): The documentation to train on.
             plan (TrainingPlan): The training plan to train on.
-        Returns:
-            str: The training pl
         """
 
         if question and not sql:
@@ -1895,12 +1940,12 @@ class VannaBase(ABC):
 
         if ddl:
             print("Adding ddl:", ddl)
-            return self.add_ddl(ddl=ddl, engine=engine)
+            return self.add_ddl(ddl)
 
         if plan:
             for item in plan._plan:
                 if item.item_type == TrainingPlanItem.ITEM_TYPE_DDL:
-                    self.add_ddl(ddl=item.item_value, engine=engine)
+                    self.add_ddl(item.item_value)
                 elif item.item_type == TrainingPlanItem.ITEM_TYPE_IS:
                     self.add_documentation(item.item_value)
                 elif item.item_type == TrainingPlanItem.ITEM_TYPE_SQL:
@@ -2143,10 +2188,11 @@ class VannaBase(ABC):
         """
         ldict = {"df": df, "px": px, "go": go}
         try:
+            # print(ldict.keys())
             exec(plotly_code, globals(), ldict)
-
             fig = ldict.get("fig", None)
-        except Exception as e:
+            return fig
+        except Exception as e:      
             # Inspect data types
             numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
             categorical_cols = df.select_dtypes(
@@ -2168,7 +2214,8 @@ class VannaBase(ABC):
                 fig = px.line(df)
 
         if fig is None:
-            return None
+            x = "Couldn't generate chart"
+            return x
 
         if dark_mode:
             fig.update_layout(template="plotly_dark")
